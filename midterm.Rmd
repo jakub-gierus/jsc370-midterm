@@ -1,0 +1,240 @@
+---
+title: "Jeopardy Data Analysis"
+author: "Jakub Gierus"
+date: "2024-03-15"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+## Introduction
+
+"Jeopardy!" is a classic American television game show, renowned for its unique answer-and-question format. Conceived by Merv Griffin, the show originally premiered in 1964 and underwent several iterations before settling into its most famous version in 1984, hosted by Alex Trebek until his death in 2020. Contestants on "Jeopardy!" compete to answer questions from various categories, presented in the form of answers to which they must supply the questions. The show is divided into three rounds: the Jeopardy round, the Double Jeopardy round, and Final Jeopardy, where contestants can wager their earnings. The first two rounds include 6 categories, and 5 questions per category, totaling 30 question per round, and a maximum of 61 questions in a game. The winner of a "Jeopardy!" game gets to be on the next game.
+
+The dataset used in this project includes question, episode and contestant data on the 217 episodes of the show's 35th season, from Show #6096 (2018-09-10) to Show #8045 (2019-07-26).
+
+**Question:** While fans of "Jeopardy!" are often fans of trivia, a lot of them are also big fans of the contestants, especially those that win a lot. Necessarily, by the format of the show, if a contestant wins a lot, they must also be in a streak of wins, since the moment they lose, they are off the show (with rare exceptions). The longer the streak, the more acclaim a contestant gets. Some of the most famous contestants are ones that had very long winning streak, like Ken Jennings (74 game win streak), Amy Schneider (40 game win streak) and James Holzhauer (32 game win streak). In this data analysis, I intend to model the relationship between to model the relationship between a contestant's performance in their first game and their win streak (if any).
+
+## Methods
+
+The dataset was acquired from the J-Archive (<https://j-archive.com/>), a database of all Jeopardy questions, shows and contestants. This analysis uses the `whatr` R package specifically to access the data. The data is cleaned by removing N/A and null values. The wrangling, cleaning descriptions for each specific table will be detailed below.
+
+------------------------------------------------------------------------
+
+
+
+### Loading libraries and dataframes
+
+```{r}
+library(whatr)
+library(ggplot2)
+library(dplyr)
+library(scales)
+library(tidyr)
+library(zoo)
+synopses <- whatr::synopses
+scores <- whatr::scores
+players <- whatr::players
+episodes <- whatr::episodes
+boards <- whatr::boards
+```
+
+### Data Wrangling
+
+The synopses table has a game id, first name, final score, right answer number and wrong answer column. 
+
+For the synopses, I mutate the table to add the correct answer rate (right / (right + wrong)), and a unique id as columns. Additionally, I sort the table by the final score.
+
+```{r synopses-wrangling}
+synopses <- synopses %>% mutate(correct_rate = right / (right + wrong))
+synopses <- synopses %>% mutate(unique_id = row_number())
+synopses_enriched <- merge(synopses, players, by.x=c("game", "name"), by.y=c("game", "first"), all.x=TRUE)
+synopses_enriched <- synopses_enriched[order(synopses_enriched$game, -synopses_enriched$final),]
+synopses_enriched$winner <- !duplicated(synopses_enriched$game)
+synopses_sorted <- synopses_enriched[order(synopses_enriched$final, decreasing = TRUE),]
+```
+
+The scores table has a game id, round (Jeopardy/1, Double Jeopardy/2, Final Jeopardy/3), clue number (i), first name, score and Daily Double boolean. 
+
+The original score tables only includes contestants that buzz in and attempt the clue. However, during the data wrangling I added an entry for every contestant for every clue, with score being 0 if they didn't buzz in. Then, I calculated the cumulative score for each contestant over the course of each game, and then ranked each game's contestant 1-3.
+
+```{r scores-wrangling}
+contestants_per_game <- scores %>% 
+  select(game, name) %>% 
+  distinct()
+
+all_clues <- scores %>%
+  select(game, i) %>%
+  distinct() 
+
+
+all_combinations <- all_clues %>%
+  left_join(distinct(contestants_per_game), by = "game") %>%
+  distinct()
+
+complete_scores <- left_join(all_combinations, scores, by = c("game", "i", "name"))
+
+complete_scores <- complete_scores %>%
+  group_by(game, i) %>%
+  mutate(round = coalesce(round, first(round[!is.na(round)])),
+         double = coalesce(double, first(double[!is.na(double)]))) %>%
+  ungroup()
+
+complete_scores <- complete_scores %>%
+  arrange(game,  i, name)
+
+complete_scores$score[is.na(complete_scores$score)] <- 0
+
+complete_scores <- complete_scores %>%
+  group_by(game, name) %>%
+  mutate(cumulative_score = cumsum(score)) %>%
+  ungroup()
+
+complete_scores <- complete_scores %>%
+  group_by(game, name) %>%
+  mutate(final_score = last(cumulative_score)) %>%
+  ungroup()
+
+complete_scores <- complete_scores %>%
+  group_by(game) %>%
+  arrange(desc(final_score), .by_group = TRUE) %>%
+  mutate(rank = match(final_score, unique(final_score))) %>%
+  ungroup()
+
+complete_scores <- complete_scores %>%
+  arrange(game,  i, name)
+```
+The players table includes the first and last name of each player. game id, and the contestant description. I wrangled this data, to add the cumulative win streak for each contestant, calculated from the modified scores table.
+
+```{r contestants-wrangling}
+winners <- complete_scores %>%
+  arrange(desc(cumulative_score)) %>%
+  group_by(game) %>%
+  slice(1) %>%
+  ungroup() %>%
+  select(game, name) %>%
+  mutate(win = 1)
+
+
+winners <- winners %>%
+  rename(first = name)
+
+win_streaks <- winners %>%
+  arrange(first, game) %>%
+  group_by(first) %>%
+  mutate(streak = cumsum(win) - cummax(cumsum(win) * (win == 0))) %>%
+  select(-win) %>%
+  arrange(game)
+
+players <- players %>%
+  left_join(win_streaks, by = c("first" = "first", "game" = "game"))
+```
+
+## Preliminary Results
+
+
+
+```{r top-and-bottom-final-scores}
+top_ten <- head(synopses_sorted, 10)
+top_ten$label <- paste(top_ten$name, top_ten$last, "(Game:", top_ten$game, ")")
+
+
+ggplot(top_ten, aes(x=reorder(label, final), y=final, fill=final)) + 
+  geom_bar(stat="identity") + 
+  theme_minimal() + 
+  coord_flip() +
+  labs(title="Top Ten Final Scores", x="Contestant", y="Final Score") +
+  theme(axis.text.x=element_text(angle=45, hjust=1)) +
+  scale_fill_gradient(low="green", high="darkgreen", name="Final Score") +
+  scale_y_continuous(labels = dollar_format(prefix = "$", big.mark = ","), breaks=seq(from=0, to=max(top_ten$final), by=10000))
+
+bottom_ten <- tail(synopses_sorted, 10)
+bottom_ten$label <- paste(bottom_ten$name, bottom_ten$last, "(Game:", bottom_ten$game, ")")
+
+ggplot(bottom_ten, aes(x=reorder(label, final), y=final, fill=final)) + 
+  geom_bar(stat="identity") + 
+  theme_minimal() + 
+  coord_flip() +
+  labs(title="Bottom Ten Final Scores", x="Contestant", y="Final Score") +
+  theme(axis.text.x=element_text(angle=45, hjust=1)) +
+  scale_fill_gradient(low="darkred", high="red", name="Final Score") +
+  scale_y_continuous(labels = dollar_format(prefix = "$", big.mark = ","), breaks=seq(from=min(bottom_ten$final), to=0, by=200))
+```
+These two plots show the top and bottom 10 final scores in Jeopardy's 35th season. The top 10 scoring games are all from James Holzhauer. During this season, James Holzhauer was an unprecedented contestant insofar that he was both really really good at triva, and routinely bet all of his money whenever he got asked a Daily Double, a unique clue where a contestant would be able to bet up to their total, thus "doubling" their money. In fact, not only does Holzhauer own the top games of the 35th season, he owns the top ten winnings games of all time. All of the bottom ten scoring games in the season are negatives, and unsurprisingly, none of them come from winners.
+
+```{r}
+ggplot(synopses, aes(x = final, y = correct_rate)) +
+  geom_point(aes(color = right), alpha = 0.6, size = 3) + 
+  geom_smooth(method = "lm", color = "blue", se = FALSE) +  
+  scale_color_gradient(low = "lightblue", high = "darkblue") +  
+  labs(x = "Final Score", y = "Correct Answer Rate", title = "Scatterplot of Final Score vs. Correct Answer Rate") +
+  theme_minimal() + 
+  theme(legend.title = element_blank()) +  
+  scale_x_continuous(labels = dollar_format(prefix = "$", big.mark = ","),  breaks=seq(from=0, to=max(synopses$final), by=30000)) +
+  scale_y_continuous(labels = function(y) paste(y*100, '%'))
+```
+The correct answer rate represents the percentage of all questions that the contestant has answered that he has also got right. As can be seen from the plot, there is not a particularly strong correlation, only a slight positive correlation between the correct answer rate and final score. This can be interpreted in a lot of ways, but what the correct answer rate does not capture how many questions a contestant answers. Thus a contestant who answered one question in a game and got it right would have a very high answer rate, but a very low final score. However, another feature of this graph is that while for low final scores, a variety of correct answer rates can be found, once you get to higher final scores (>$30,000), you need a high (>%90) correct answer rate for this. A possible explanation for this is that every correct answer in Jeopardy deducts the value of the clue. Thus, if you want a high score you need to both be answering a lot of questions right AND not answering many questions wrong.
+
+
+```{r fig.width=10, fig.height=5}
+average_scores <- complete_scores %>%
+  group_by(i, rank) %>%
+  summarize(average_cumulative_score = mean(cumulative_score, na.rm = TRUE)) %>%
+  ungroup()
+
+
+ggplot() +
+  # All games in the background
+  geom_line(data = complete_scores, aes(x = i, y = cumulative_score, group = interaction(game, name)), alpha = 0.1) +
+  # Average lines for top, middle, bottom scorers
+   geom_smooth(data = average_scores, aes(x = i, y = average_cumulative_score, color = as.factor(rank)), 
+              method = "gam", # This method is suitable for smaller datasets; consider "gam" for larger datasets
+              se = FALSE, # Don't show the confidence interval around the smooth
+              size = 1) +
+  scale_color_manual(values = c("1" = "green", "2" = "yellow", "3" = "red"), labels = c("1" = "Winner", "2" = "Middle Scorer", "3" = "Bottom Scorer")) +
+  theme_minimal() +
+    theme(
+    panel.grid.major.x = element_blank(), 
+    panel.grid.minor.x = element_blank(), 
+    panel.grid.major.y = element_blank(),
+     panel.grid.minor.y = element_blank()
+  ) +
+  labs(title = "Cumulative Scores Across All Games",
+       x = "Clue Number",
+       y = "Cumulative Score",
+       color = "Contestant Rank") +
+  guides(color = guide_legend(title = "Final Score Rank")) + 
+  scale_y_continuous(labels = dollar_format(prefix = "$", big.mark = ","), breaks=seq(from=0, to=100000, by=10000))
+```
+
+This figure shows the progression of every game of the season superimposed upon each other, in the black lines, and the average game for a winner, a middle scorer and a bottom scorer, colored in green, yellow and red respectively. You might notice that there are many significant (>$10,000) jumps up and down, despite the maximum value of a clue only being $2000. These are daily doubles, a special clue wherein a contestant can bet any amount of money, up to their total. At the end of the game, Final Jeopardy, everyone gets an opportunity to bet any amount of money, leading to those huge spikes for everyone at clue 61. The majority of games, where the lines are densest, end with the contestants making $0-$30,000. Those few games where the contestants win upward of $60,000 are all James Holzhauer games.  The average winner won $30,000 and the average bottom scorer of a game only had a final score of $5,000. Interestingly, the winner, on average, leads the entire game, and the loser is trailing both other contestants the entire game, and also loses money on average during Final Jeopardy, as can be seen by the dip at the end.
+
+```{r}
+
+top_streaks <- players %>%
+  group_by(first, last) %>%
+  summarize(max_streak = max(streak, na.rm = TRUE)) %>%
+  ungroup() %>%
+  arrange(desc(max_streak)) %>%
+  top_n(10, max_streak)
+
+top_streaks$label <- paste(top_streaks$first, top_streaks$last, "(", top_streaks$max_streak, ")")
+
+
+ggplot(top_streaks, aes(x = reorder(label, max_streak), y = max_streak, fill = max_streak)) +
+  geom_bar(stat = "identity") +
+  scale_fill_gradient(low = "lightgreen", high = "darkgreen") + 
+  labs(title = "Top Ten Win Streaks",
+       x = "Contestant",
+       y = "Win Streak") +
+  coord_flip() + 
+  theme_minimal()
+
+```
+As is already supported by the other figures, James Holzhauer is an unprecedented talen in Jeopardy, holding not only by far the longest win streak of this season of Jeopardy, but also holding the 4th highest win streak all-time. There were many people who had win streaks of 5.
+
+## Summary
+
+In regards to answering the question of modelling the relationship between single game  winnings and win streak length, we have made no direct analysis of that yet. However, it is clear that there is some positive relationship between the two when looking at the data. The top win streak of the season also holds the top 10 single game scoring records for the season. In order to keep a long winning streak (>4 games), contestants must be getting many questions right and almost no questions wrong, which will also lead to getting high single game scoring games. Otherwise, variance in the categories, luck in getting daily doubles, and the single elimination format can easily lead to a "worse" contestant beating another "better" contestant, stopping their streak. Further, deeper analysis will be needed to fully explore and model the relationship between win streaking and single game scores.
